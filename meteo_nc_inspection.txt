@@ -1,0 +1,156 @@
+================================================================================
+DATASET SUMMARY
+================================================================================
+<xarray.Dataset>
+Dimensions:                    (time: 152806, y: 103, x: 201)
+Coordinates:
+  * time                       (time) datetime64[ns] 2004-01-01 ... 2021-06-0...
+Dimensions without coordinates: y, x
+Data variables:
+    Y                          (y) float64 ...
+    X                          (x) float64 ...
+    air_pressure_fixed_height  (time, y, x) float32 ...
+    eastward_wind              (time, y, x) float32 ...
+    northward_wind             (time, y, x) float32 ...
+    C                          (time, y, x) float32 ...
+
+================================================================================
+GLOBAL ATTRIBUTES
+================================================================================
+
+================================================================================
+DIMENSIONS
+================================================================================
+time: 152806
+y: 103
+x: 201
+
+================================================================================
+COORDINATES
+================================================================================
+
+time
+  dims: ('time',)
+  shape: (152806,)
+  dtype: datetime64[ns]
+  time_origin: 01-Jan-1900 00:00:00
+  long name: Time - minutes since 01-Jan-1900 00:00:00 +00:00
+  standard_name: time
+  calender: gregorian
+  first: 2004-01-01 00:00:00
+  last:  2021-06-06 21:00:00
+  median timestep: 1.000 hours
+
+================================================================================
+DATA VARIABLES
+================================================================================
+
+Y
+  dims: ('y',)
+  shape: (103,)
+  dtype: float64
+  standard_name: latitude
+  units: degrees_north
+  min: 41.5
+  max: 67.0
+  mean: 54.25
+  nan_fraction: 0.0
+
+X
+  dims: ('x',)
+  shape: (201,)
+  dtype: float64
+  standard_name: longitude
+  units: degrees_east
+  min: -19.0
+  max: 31.0
+  mean: 6.0
+  nan_fraction: 0.0
+
+air_pressure_fixed_height
+  dims: ('time', 'y', 'x')
+  shape: (152806, 103, 201)
+  dtype: float32
+  coordinates: y x
+  long_name: Mean sea level pressure
+  standard_name: air_pressure
+  units: Pa
+  min: 94159.875
+  max: 105821.671875
+  mean: 101271.27594651731
+  nan_fraction: 0.0
+
+eastward_wind
+  dims: ('time', 'y', 'x')
+  shape: (152806, 103, 201)
+  dtype: float32
+  coordinates: y x
+  long_name: 10 metre U wind component
+  standard_name: eastward_wind
+  units: m s**-1
+  min: -20.626522064208984
+  max: 24.867509841918945
+  mean: 1.1499792524306889
+  nan_fraction: 0.0
+
+northward_wind
+  dims: ('time', 'y', 'x')
+  shape: (152806, 103, 201)
+  dtype: float32
+  coordinates: y x
+  long_name: 10 metre V wind component
+  standard_name: northward_wind
+  units: m s**-1
+  min: -24.432031631469727
+  max: 24.528337478637695
+  mean: 0.42614475589257467
+  nan_fraction: 0.0
+
+C
+  dims: ('time', 'y', 'x')
+  shape: (152806, 103, 201)
+  dtype: float32
+  coordinates: y x
+  long_name: Charnock parameter
+  standard_name: charnock
+  units: -
+  min: 0.007528809830546379
+  max: 0.10577224940061569
+  mean: 0.01714254520876356
+  nan_fraction: 0.0
+
+================================================================================
+LIKELY USABLE VARIABLES
+================================================================================
+air_pressure: air_pressure_fixed_height
+eastward_wind: eastward_wind
+northward_wind: northward_wind
+charnock: C
+air_density: None
+
+================================================================================
+TIME COVERAGE
+================================================================================
+time variable: time
+first time: 2004-01-01 00:00:00
+last time:  2021-06-06 21:00:00
+covers 2013-2017: True
+minimum timestep: 1.000 hours
+median timestep: 1.000 hours
+maximum timestep: 1.000 hours
+irregular timestep: False
+
+================================================================================
+SPATIAL COVERAGE
+================================================================================
+longitude/x variable: X
+latitude/y variable:  Y
+longitude/x range: -19.0 to 31.0
+latitude/y range: 41.5 to 67.0
+
+================================================================================
+PRELIMINARY SUITABILITY
+================================================================================
+Wind: suitable candidate for both D-Flow FM and SWAN, subject to checking units, height and spatial coverage.
+Pressure: suitable candidate for D-Flow FM.
+Charnock parameter: potentially usable by D-Flow FM if the selected wind-drag formulation expects it; not normally passed to SWAN.
