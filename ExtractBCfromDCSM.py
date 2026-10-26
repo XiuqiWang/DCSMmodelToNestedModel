@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
-"""
-Extract water level and ux,uy advection velocity at the observation points from the DCSM model to be used as boundary conditions for the child model. The ux,uy are displayed at each sigma layer in the child flow model as 3d conditions. 
+"""Extract named DCSM-FM history stations to 3D child-model BC files.
 
+The child boundary PLI files must already exist. Their support-point names
+must exactly match the station names stored in the DCSM history file.
+No PLI, EXT, coordinate transformation, or velocity rotation is performed.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -13,781 +16,509 @@ import pandas as pd
 import xarray as xr
 
 
-# ==================================================================
+# =============================================================================
 # USER SETTINGS
-# ==================================================================
+# =============================================================================
+HISTORY_FILE = Path(r"C:\dev\Python\DCSMmodelToNestedModel\hist_files\DCSM-FM_0_5nm_0000_his.nc")
+OUTPUT_DIRECTORY = Path(r"bc_files")
 
-nc_path = Path("DCSM-FM_0_5nm_restarted_his.nc")
-
-out_wl = Path("nested_waterlevel.bc")
-out_uv = Path("nested_uxuyadvectionvelocity.bc")
-
-time_origin = pd.Timestamp("2013-12-05 00:00:00")
-time_unit = f"seconds since {time_origin:%Y-%m-%d %H:%M:%S}"
-
-# Five child sigma-layer centres, ordered BED -> SURFACE.
+# Recommended child-model vertical grid:
+#   Kmx         = 10
+#   Layertype   = 1
+#   StretchType = 1
+#   StretchCoef = 4.0 5.9 8.7 12.7 18.7 18.7 12.7 8.7 5.9 4.0
 #
-# sigma = -1 at the bed
-# sigma =  0 at the free surface
-#
-# These correspond to 10, 30, 50, 70, 90 percent upward from the bed.
-sigma_centres = np.array(
-    [-0.9, -0.7, -0.5, -0.3, -0.1],
+# Layer THICKNESSES in percent, ordered BED -> SURFACE. They must be positive
+# and sum to 100. BC profile positions are calculated at the layer centres.
+SIGMA_LAYER_THICKNESS_PERCENT = np.array(
+    [4.0, 5.9, 8.7, 12.7, 18.7, 18.7, 12.7, 8.7, 5.9, 4.0],
     dtype=float,
 )
 
-vertical_positions_percent_from_bed = np.array(
-    [10.0, 30.0, 50.0, 70.0, 90.0],
-    dtype=float,
-)
+# Only history stations matching at least one expression are exported.
+# Names are preserved exactly; they are not renamed or renumbered.
+BOUNDARY_STATION_PATTERNS = [
+    r"^North(?:[-_ ]|\d)",
+    r"^Offshore(?:[-_ ]|\d)",
+    r"^South(?:[-_ ]|\d)",
+]
 
-# Replace this placeholder with the actual CHILD-model bed elevation at
-# every boundary support point, in the same vertical datum used below.
-default_child_bedlevel = -10.0
+# Optional exact list. When non-empty, it replaces the pattern selection.
+# This is the safest mode because every expected PLI point is stated exactly.
+# Example:
+# BOUNDARY_STATION_NAMES = [
+#     "North_0001", "North_0002", "Offshore_0001", "South_0001"
+# ]
+BOUNDARY_STATION_NAMES: list[str] = []
 
-# Example datum correction:
-# parent MSL2013 elevation + 1.95 m -> NAP
-#
-# Confirm this correction independently before production use.
-waterlevel_offset_parent_to_child_datum = 1.95
+# If None, the first history timestamp is used as the BC reference time.
+# Example alternative: pd.Timestamp("2013-01-01 00:00:00")
+BC_REFERENCE_TIME: pd.Timestamp | None = None
+
+# Keep zero unless a verified parent-to-child vertical-datum difference exists.
+WATERLEVEL_OFFSET_M = 0.0
+
+OUTPUT_WATERLEVEL = "nested_waterlevel.bc"
+OUTPUT_VELOCITY = "nested_uxuyadvectionvelocity.bc"
+OUTPUT_SALINITY = "nested_salinity.bc"
+OUTPUT_TEMPERATURE = "nested_temperature.bc"
 
 
-# ==================================================================
+# =============================================================================
+# EXPECTED HISTORY VARIABLES
+# =============================================================================
+
+CANDIDATES = {
+    "station_name": ["station_name", "stations"],
+    "waterlevel": ["waterlevel", "s1"],
+    "waterdepth": ["waterdepth", "water_depth", "hs"],
+    "x_velocity": ["x_velocity", "ucx", "u"],
+    "y_velocity": ["y_velocity", "ucy", "v"],
+    "salinity": ["salinity", "sa1", "salt"],
+    "temperature": ["temperature", "tem1", "water_temperature"],
+    "zcoordinate_c": ["zcoordinate_c", "z_coordinate_c", "zcor"],
+}
+
+
+# =============================================================================
 # HELPERS
-# ==================================================================
+# =============================================================================
 
-def decode_station_names(ds: xr.Dataset) -> list[str]:
-    """Return clean observation-station names."""
-    if "station_name" not in ds:
-        raise KeyError("Dataset does not contain 'station_name'.")
-
-    names: list[str] = []
-
-    for value in ds["station_name"].values:
-        if isinstance(value, bytes):
-            name = value.decode("utf-8").strip()
-        else:
-            name = str(value).strip()
-
-        if not name:
-            raise ValueError("An empty station name was found.")
-
-        names.append(name)
-
-    if len(names) != len(set(names)):
-        duplicates = sorted(
-            {name for name in names if names.count(name) > 1}
-        )
+def sigma_layer_centres(thickness_percent: np.ndarray) -> np.ndarray:
+    """Return layer-centre positions in percent upward from the bed."""
+    thickness = np.asarray(thickness_percent, dtype=float)
+    if thickness.ndim != 1 or thickness.size == 0:
+        raise ValueError("SIGMA_LAYER_THICKNESS_PERCENT must be a 1-D array.")
+    if np.any(thickness <= 0):
+        raise ValueError("All sigma-layer thicknesses must be positive.")
+    if not np.isclose(thickness.sum(), 100.0, atol=1e-8):
         raise ValueError(
-            f"Station names are not unique: {duplicates}"
+            "SIGMA_LAYER_THICKNESS_PERCENT must sum to 100; "
+            f"found {thickness.sum():.12g}."
         )
+    lower_interfaces = np.concatenate(([0.0], np.cumsum(thickness)[:-1]))
+    return lower_interfaces + 0.5 * thickness
 
+
+def find_variable(ds: xr.Dataset, role: str) -> str:
+    for name in CANDIDATES[role]:
+        if name in ds.variables:
+            return name
+    raise KeyError(
+        f"Could not find {role!r}. Tried {CANDIDATES[role]}.\n"
+        f"Available variables:\n{list(ds.variables)}"
+    )
+
+
+def decode_station_names(values: np.ndarray) -> list[str]:
+    """Decode NetCDF string arrays and two-dimensional character arrays."""
+    array = np.asarray(values)
+    if array.ndim == 2 and array.dtype.kind in {"S", "U"}:
+        names = []
+        for row in array:
+            name = "".join(
+                item.decode("utf-8")
+                if isinstance(item, (bytes, np.bytes_))
+                else str(item)
+                for item in row
+            )
+            names.append(name.replace("\x00", "").strip())
+    else:
+        names = []
+        for item in array.reshape(-1):
+            name = (
+                item.decode("utf-8")
+                if isinstance(item, (bytes, np.bytes_))
+                else str(item)
+            )
+            names.append(name.replace("\x00", "").strip())
+
+    if any(not name for name in names):
+        raise ValueError("At least one empty station name was found.")
+    if len(names) != len(set(names)):
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        raise ValueError(f"History station names are not unique: {duplicates}")
     return names
 
 
-def require_variable(
-    ds: xr.Dataset,
-    variable: str,
-    required_dims: tuple[str, ...],
-) -> xr.DataArray:
-    """Validate that a required variable and dimensions exist."""
-    if variable not in ds:
-        raise KeyError(
-            f"Required variable {variable!r} is absent from the dataset."
+def select_boundary_station_indices(station_names: list[str]) -> list[int]:
+    """Select stations while preserving history-file order and exact names."""
+    if BOUNDARY_STATION_NAMES:
+        if len(BOUNDARY_STATION_NAMES) != len(set(BOUNDARY_STATION_NAMES)):
+            raise ValueError("BOUNDARY_STATION_NAMES contains duplicates.")
+        missing = [name for name in BOUNDARY_STATION_NAMES if name not in station_names]
+        if missing:
+            raise ValueError(
+                "These explicitly requested boundary names are absent from "
+                f"the history file: {missing}"
+            )
+        return [station_names.index(name) for name in BOUNDARY_STATION_NAMES]
+
+    indices = [
+        i
+        for i, name in enumerate(station_names)
+        if any(
+            re.search(pattern, name, flags=re.IGNORECASE)
+            for pattern in BOUNDARY_STATION_PATTERNS
         )
-
-    da = ds[variable]
-
-    missing_dims = [
-        dim for dim in required_dims
-        if dim not in da.dims
     ]
-
-    if missing_dims:
+    if not indices:
         raise ValueError(
-            f"{variable!r} is missing dimensions {missing_dims}. "
-            f"Found dimensions: {da.dims}"
+            "No history stations match BOUNDARY_STATION_PATTERNS. "
+            "Inspect station_name and update the patterns or provide "
+            "BOUNDARY_STATION_NAMES explicitly."
+        )
+    return indices
+
+
+def identify_dimensions(
+    ds: xr.Dataset,
+    station_name_var: str,
+    waterlevel_var: str,
+    z_var: str,
+) -> tuple[str, str, str]:
+    if "time" not in ds.variables:
+        raise KeyError("The history file has no time variable.")
+    time_dim = ds["time"].dims[0]
+
+    station_dims = [d for d in ds[waterlevel_var].dims if d != time_dim]
+    if len(station_dims) != 1:
+        raise ValueError(
+            f"Cannot identify station dimension from {waterlevel_var}: "
+            f"{ds[waterlevel_var].dims}"
+        )
+    station_dim = station_dims[0]
+    if station_dim not in ds[station_name_var].dims:
+        raise ValueError(
+            f"{station_name_var} does not use station dimension {station_dim}."
         )
 
-    return da
+    layer_dims = [d for d in ds[z_var].dims if d not in {time_dim, station_dim}]
+    if len(layer_dims) != 1:
+        raise ValueError(
+            f"Cannot identify vertical dimension from {z_var}: {ds[z_var].dims}"
+        )
+    return time_dim, station_dim, layer_dims[0]
 
 
-def validate_velocity_metadata(ds: xr.Dataset) -> None:
-    """
-    Confirm that x_velocity/y_velocity are horizontal x/y components.
-    """
-    expected = {
-        "x_velocity": (
-            "x-component",
-            "sea_water_x_velocity",
-        ),
-        "y_velocity": (
-            "y-component",
-            "sea_water_y_velocity",
-        ),
-    }
-
-    for variable, expected_terms in expected.items():
-        if variable not in ds:
-            raise KeyError(f"{variable!r} is not in the dataset.")
-
-        da = ds[variable]
-
-        description = " ".join(
-            str(da.attrs.get(key, ""))
-            for key in (
-                "long_name",
-                "standard_name",
-                "description",
-            )
-        ).lower()
-
-        if not any(term.lower() in description for term in expected_terms):
-            raise ValueError(
-                f"The metadata for {variable!r} does not clearly identify "
-                "it as the expected horizontal component.\n"
-                f"Attributes: {dict(da.attrs)}"
-            )
-
-        units = str(da.attrs.get("units", "")).replace(" ", "").lower()
-
-        if units not in {"ms-1", "m/s", "ms^-1"}:
-            raise ValueError(
-                f"Unexpected units for {variable!r}: "
-                f"{da.attrs.get('units')!r}"
-            )
+def require_dims(
+    da: xr.DataArray,
+    expected: tuple[str, ...],
+    role: str,
+) -> xr.DataArray:
+    missing = [dimension for dimension in expected if dimension not in da.dims]
+    if missing:
+        raise ValueError(
+            f"{role} variable {da.name!r} lacks dimensions {missing}; "
+            f"found {da.dims}."
+        )
+    return da.transpose(*expected)
 
 
-def interp_profile(
-    z_parent: np.ndarray,
-    value_parent: np.ndarray,
+def interpolate_profile(
+    z_source: np.ndarray,
+    values_source: np.ndarray,
     z_target: np.ndarray,
 ) -> np.ndarray:
-    """
-    Interpolate one parent vertical profile to target elevations.
+    """Interpolate vertically; hold closest values outside valid centres."""
+    z = np.asarray(z_source, dtype=float)
+    values = np.asarray(values_source, dtype=float)
+    target = np.asarray(z_target, dtype=float)
+    valid = np.isfinite(z) & np.isfinite(values)
 
-    Values outside the valid parent range are held at the nearest valid
-    endpoint. Change this policy if extrapolation is undesirable.
-    """
-    z_parent = np.asarray(z_parent, dtype=float)
-    value_parent = np.asarray(value_parent, dtype=float)
-    z_target = np.asarray(z_target, dtype=float)
+    if valid.sum() == 0:
+        return np.full(target.shape, np.nan)
+    if valid.sum() == 1:
+        return np.full(target.shape, values[valid][0])
 
-    valid = (
-        np.isfinite(z_parent)
-        & np.isfinite(value_parent)
-    )
-
-    if valid.sum() < 2:
-        return np.full(
-            z_target.shape,
-            np.nan,
-            dtype=float,
-        )
-
-    z = z_parent[valid]
-    values = value_parent[valid]
-
+    z = z[valid]
+    values = values[valid]
     order = np.argsort(z)
     z = z[order]
     values = values[order]
+    z, unique_indices = np.unique(z, return_index=True)
+    values = values[unique_indices]
+    if z.size == 1:
+        return np.full(target.shape, values[0])
+    return np.interp(target, z, values, left=values[0], right=values[-1])
 
-    # Remove duplicate vertical coordinates because np.interp expects
-    # increasing coordinate values.
-    z_unique, unique_indices = np.unique(
-        z,
-        return_index=True,
+
+def time_unit_and_seconds(times: pd.DatetimeIndex) -> tuple[str, np.ndarray]:
+    reference = (
+        pd.Timestamp(times[0])
+        if BC_REFERENCE_TIME is None
+        else pd.Timestamp(BC_REFERENCE_TIME)
     )
-    values_unique = values[unique_indices]
-
-    if z_unique.size < 2:
-        return np.full(
-            z_target.shape,
-            np.nan,
-            dtype=float,
-        )
-
-    return np.interp(
-        z_target,
-        z_unique,
-        values_unique,
-        left=values_unique[0],
-        right=values_unique[-1],
+    elapsed = ((times - reference) / pd.Timedelta(seconds=1)).to_numpy(float)
+    if elapsed[0] < 0 or np.any(np.diff(elapsed) <= 0):
+        raise ValueError("BC times must be non-negative and strictly increasing.")
+    rounded = np.rint(elapsed)
+    if not np.allclose(elapsed, rounded, atol=1e-6):
+        raise ValueError("Times are not integer seconds from BC_REFERENCE_TIME.")
+    return (
+        f"seconds since {reference:%Y-%m-%d %H:%M:%S} +00:00",
+        rounded.astype(np.int64),
     )
 
 
-def write_waterlevel_header(
-    file_object,
-    station: str,
-) -> None:
-    """Write one D-Flow FM water-level forcing header."""
-    file_object.write("[Forcing]\n")
-    file_object.write(f"name              = {station}\n")
-    file_object.write("function          = timeseries\n")
-    file_object.write("timeInterpolation = linear\n")
-    file_object.write("quantity          = time\n")
-    file_object.write(f"unit              = {time_unit}\n")
-    file_object.write("quantity          = waterlevelbnd\n")
-    file_object.write("unit              = m\n")
-
-
-def write_uxuy_t3d_header(
-    file_object,
-    station: str,
+def forcing_prefix(
+    handle,
+    station_name: str,
+    function: str,
+    time_unit: str,
     vertical_positions: np.ndarray,
 ) -> None:
-    """
-    Write a T3D ux/uy advection-velocity forcing header.
+    handle.write("[Forcing]\n")
+    handle.write(f"name              = {station_name}\n")
+    handle.write(f"function          = {function}\n")
+    handle.write("timeInterpolation = linear\n")
+    if function == "t3d":
+        positions = " ".join(f"{position:.8g}" for position in vertical_positions)
+        handle.write(f"vertPositions     = {positions}\n")
+        handle.write("vertInterpolation = linear\n")
+        handle.write("vertPositionType  = percBed\n")
+    handle.write("quantity          = time\n")
+    handle.write(f"unit              = {time_unit}\n")
 
-    Data-column order:
-        time,
-        ux(z1), uy(z1),
-        ux(z2), uy(z2),
-        ...
-    """
-    positions_text = " ".join(
-        f"{position:g}"
-        for position in vertical_positions
-    )
 
-    file_object.write("[Forcing]\n")
-    file_object.write(f"name              = {station}\n")
-    file_object.write("function          = t3d\n")
-    file_object.write("timeInterpolation = linear\n")
-    file_object.write("vertPositionType  = percBed\n")
-    file_object.write(
-        f"vertPositions     = {positions_text}\n"
-    )
-    file_object.write("vertInterpolation = linear\n")
+def write_scalar_t3d_header(
+    handle,
+    station_name: str,
+    time_unit: str,
+    vertical_positions: np.ndarray,
+    quantity: str,
+    unit: str,
+) -> None:
+    forcing_prefix(handle, station_name, "t3d", time_unit, vertical_positions)
+    for layer_number in range(1, len(vertical_positions) + 1):
+        handle.write(f"quantity          = {quantity}\n")
+        handle.write(f"unit              = {unit}\n")
+        handle.write(f"vertPositionIndex = {layer_number}\n")
 
-    file_object.write("quantity          = time\n")
-    file_object.write(f"unit              = {time_unit}\n")
 
-    file_object.write(
-        "vector            = "
-        "uxuyadvectionvelocitybnd:ux,uy\n"
-    )
+def write_velocity_t3d_header(
+    handle,
+    station_name: str,
+    time_unit: str,
+    vertical_positions: np.ndarray,
+) -> None:
+    forcing_prefix(handle, station_name, "t3d", time_unit, vertical_positions)
+    handle.write("vector            = uxuyadvectionvelocitybnd:ux,uy\n")
+    for layer_number in range(1, len(vertical_positions) + 1):
+        handle.write("quantity          = ux\n")
+        handle.write("unit              = m/s\n")
+        handle.write(f"vertPositionIndex = {layer_number}\n")
+        handle.write("quantity          = uy\n")
+        handle.write("unit              = m/s\n")
+        handle.write(f"vertPositionIndex = {layer_number}\n")
 
-    for vertical_index in range(1, len(vertical_positions) + 1):
-        file_object.write("quantity          = ux\n")
-        file_object.write("unit              = m/s\n")
-        file_object.write(
-            f"vertPositionIndex = {vertical_index}\n"
+
+def write_data_row(handle, time_seconds: int, values: np.ndarray) -> None:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("A non-finite value would be written to a BC file.")
+    handle.write(f"{time_seconds:12d}")
+    for value in array:
+        handle.write(f" {value:.8g}")
+    handle.write("\n")
+
+
+# =============================================================================
+# CONVERSION
+# =============================================================================
+
+def main() -> None:
+    if not HISTORY_FILE.is_file():
+        raise FileNotFoundError(f"History file not found: {HISTORY_FILE}")
+    OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    vertical_positions = sigma_layer_centres(SIGMA_LAYER_THICKNESS_PERCENT)
+    vertical_fractions = vertical_positions / 100.0
+    print("BC vertical positions (% upward from bed):")
+    print(" ".join(f"{value:.3f}" for value in vertical_positions))
+
+    with xr.open_dataset(HISTORY_FILE, decode_times=True, mask_and_scale=True) as ds:
+        variable_names = {role: find_variable(ds, role) for role in CANDIDATES}
+        station_names = decode_station_names(
+            ds[variable_names["station_name"]].values
         )
+        selected_indices = select_boundary_station_indices(station_names)
 
-        file_object.write("quantity          = uy\n")
-        file_object.write("unit              = m/s\n")
-        file_object.write(
-            f"vertPositionIndex = {vertical_index}\n"
+        print(f"Selected {len(selected_indices)} boundary stations:")
+        for index in selected_indices:
+            print(f"  {station_names[index]}")
+
+        time_dim, station_dim, layer_dim = identify_dimensions(
+            ds,
+            variable_names["station_name"],
+            variable_names["waterlevel"],
+            variable_names["zcoordinate_c"],
         )
+        times = pd.DatetimeIndex(pd.to_datetime(ds["time"].values))
+        time_unit, time_seconds = time_unit_and_seconds(times)
 
+        waterlevel = require_dims(
+            ds[variable_names["waterlevel"]],
+            (time_dim, station_dim),
+            "waterlevel",
+        ).load()
+        waterdepth = require_dims(
+            ds[variable_names["waterdepth"]],
+            (time_dim, station_dim),
+            "waterdepth",
+        ).load()
+        expected_3d_dims = (time_dim, station_dim, layer_dim)
+        z_coordinate = require_dims(
+            ds[variable_names["zcoordinate_c"]],
+            expected_3d_dims,
+            "zcoordinate_c",
+        ).load()
+        x_velocity = require_dims(
+            ds[variable_names["x_velocity"]],
+            expected_3d_dims,
+            "x_velocity",
+        ).load()
+        y_velocity = require_dims(
+            ds[variable_names["y_velocity"]],
+            expected_3d_dims,
+            "y_velocity",
+        ).load()
+        salinity = require_dims(
+            ds[variable_names["salinity"]],
+            expected_3d_dims,
+            "salinity",
+        ).load()
+        temperature = require_dims(
+            ds[variable_names["temperature"]],
+            expected_3d_dims,
+            "temperature",
+        ).load()
 
-def format_time_seconds(value: float) -> str:
-    """Format elapsed seconds without introducing round-off noise."""
-    rounded = round(float(value))
+        output_paths = {
+            "waterlevel": OUTPUT_DIRECTORY / OUTPUT_WATERLEVEL,
+            "velocity": OUTPUT_DIRECTORY / OUTPUT_VELOCITY,
+            "salinity": OUTPUT_DIRECTORY / OUTPUT_SALINITY,
+            "temperature": OUTPUT_DIRECTORY / OUTPUT_TEMPERATURE,
+        }
 
-    if not np.isclose(value, rounded, atol=1e-6):
-        raise ValueError(
-            f"Time value {value} is not an integer number of seconds."
-        )
-
-    return f"{rounded:12d}"
-
-
-# ==================================================================
-# OPEN AND VALIDATE THE PARENT HISTORY FILE
-# ==================================================================
-
-with xr.open_dataset(nc_path) as ds:
-
-    station_names = decode_station_names(ds)
-    validate_velocity_metadata(ds)
-
-    waterlevel_da = require_variable(
-        ds,
-        "waterlevel",
-        ("time", "station"),
-    )
-    ux_da = require_variable(
-        ds,
-        "x_velocity",
-        ("time", "station", "laydim"),
-    )
-    uy_da = require_variable(
-        ds,
-        "y_velocity",
-        ("time", "station", "laydim"),
-    )
-    z_da = require_variable(
-        ds,
-        "zcoordinate_c",
-        ("time", "station", "laydim"),
-    )
-
-    # Explicitly arrange all 3D arrays in one known dimension order.
-    ux_da = ux_da.transpose("time", "station", "laydim")
-    uy_da = uy_da.transpose("time", "station", "laydim")
-    z_da = z_da.transpose("time", "station", "laydim")
-
-    waterlevel_da = waterlevel_da.transpose(
-        "time",
-        "station",
-    )
-
-    time_values = pd.DatetimeIndex(
-        pd.to_datetime(ds["time"].values)
-    )
-
-    time_seconds = (
-        (time_values - time_origin)
-        / pd.Timedelta(seconds=1)
-    ).to_numpy(dtype=float)
-
-    if np.any(np.diff(time_seconds) <= 0):
-        raise ValueError(
-            "Dataset times must be strictly increasing."
-        )
-
-    if time_seconds[0] < 0:
-        raise ValueError(
-            f"The first input time {time_values[0]} is earlier than "
-            f"the BC reference time {time_origin}."
-        )
-
-    # Actual CHILD-model bed elevation at each support point.
-    # Replace this dictionary with values read from the child grid.
-    child_bedlevel = {
-        station: default_child_bedlevel
-        for station in station_names
-    }
-
-    n_times = len(time_seconds)
-    n_layers = len(sigma_centres)
-
-    with out_wl.open("w", encoding="utf-8", newline="\n") as f_wl, \
-         out_uv.open("w", encoding="utf-8", newline="\n") as f_uv:
-
-        for station_index, station in enumerate(station_names):
-
-            waterlevel_parent = (
-                waterlevel_da
-                .isel(station=station_index)
-                .values
-                .astype(float)
-            )
-
-            ux_parent = (
-                ux_da
-                .isel(station=station_index)
-                .values
-                .astype(float)
-            )
-
-            uy_parent = (
-                uy_da
-                .isel(station=station_index)
-                .values
-                .astype(float)
-            )
-
-            z_parent = (
-                z_da
-                .isel(station=station_index)
-                .values
-                .astype(float)
-            )
-
-            if ux_parent.shape != uy_parent.shape:
-                raise ValueError(
-                    f"ux/uy shapes differ at {station}: "
-                    f"{ux_parent.shape} versus {uy_parent.shape}"
+        with (
+            output_paths["waterlevel"].open("w", encoding="utf-8", newline="\n") as f_wl,
+            output_paths["velocity"].open("w", encoding="utf-8", newline="\n") as f_uv,
+            output_paths["salinity"].open("w", encoding="utf-8", newline="\n") as f_sal,
+            output_paths["temperature"].open("w", encoding="utf-8", newline="\n") as f_tem,
+        ):
+            for station_index in selected_indices:
+                station_name = station_names[station_index]
+                wl_values = np.asarray(
+                    waterlevel.isel({station_dim: station_index}), dtype=float
+                )
+                depth_values = np.asarray(
+                    waterdepth.isel({station_dim: station_index}), dtype=float
+                )
+                z_values = np.asarray(
+                    z_coordinate.isel({station_dim: station_index}), dtype=float
+                )
+                ux_values = np.asarray(
+                    x_velocity.isel({station_dim: station_index}), dtype=float
+                )
+                uy_values = np.asarray(
+                    y_velocity.isel({station_dim: station_index}), dtype=float
+                )
+                sal_values = np.asarray(
+                    salinity.isel({station_dim: station_index}), dtype=float
+                )
+                tem_values = np.asarray(
+                    temperature.isel({station_dim: station_index}), dtype=float
                 )
 
-            if ux_parent.shape != z_parent.shape:
-                raise ValueError(
-                    f"Velocity and vertical-coordinate shapes differ "
-                    f"at {station}."
+                bed_values = wl_values - depth_values
+                target_z = (
+                    bed_values[:, None]
+                    + depth_values[:, None] * vertical_fractions[None, :]
                 )
+                shape = (len(times), len(vertical_positions))
+                ux_output = np.full(shape, np.nan)
+                uy_output = np.full(shape, np.nan)
+                sal_output = np.full(shape, np.nan)
+                tem_output = np.full(shape, np.nan)
 
-            if ux_parent.shape[0] != n_times:
-                raise ValueError(
-                    f"Unexpected number of times at {station}."
-                )
-
-            # ------------------------------------------------------
-            # Convert all elevations into the child vertical datum
-            # ------------------------------------------------------
-            datum_offset = waterlevel_offset_parent_to_child_datum
-
-            waterlevel_child_datum = waterlevel_parent + datum_offset
-            z_parent_child_datum = z_parent + datum_offset
-            zb_child = float(child_bedlevel[station])
-
-            # ------------------------------------------------------
-            # Interpolate eastward/northward parent velocities to
-            # five child sigma-layer centres
-            # ------------------------------------------------------
-            ux_sigma = np.full(
-                (n_times, n_layers),
-                np.nan,
-                dtype=float,
-            )
-
-            uy_sigma = np.full(
-                (n_times, n_layers),
-                np.nan,
-                dtype=float,
-            )
-
-            for time_index in range(n_times):
-                eta = waterlevel_child_datum[time_index]
-
-                if not np.isfinite(eta):
-                    continue
-
-                water_depth = eta - zb_child
-
-                if water_depth <= 0.0:
-                    continue
-
-                z_sigma = eta + sigma_centres * water_depth
-
-                ux_sigma[time_index, :] = interp_profile(
-                    z_parent_child_datum[time_index, :],
-                    ux_parent[time_index, :],
-                    z_sigma,
-                )
-
-                uy_sigma[time_index, :] = interp_profile(
-                    z_parent_child_datum[time_index, :],
-                    uy_parent[time_index, :],
-                    z_sigma,
-                )
-
-            if np.isnan(ux_sigma).any() or np.isnan(uy_sigma).any():
-                bad_count = int(
-                    np.isnan(ux_sigma).sum()
-                    + np.isnan(uy_sigma).sum()
-                )
-
-                raise ValueError(
-                    f"{station}: {bad_count} interpolated velocity "
-                    "values are NaN. Check wet/dry conditions, parent "
-                    "profiles and child bed elevation."
-                )
-
-            # ------------------------------------------------------
-            # Write water-level forcing
-            # ------------------------------------------------------
-            write_waterlevel_header(f_wl, station)
-
-            for time_value, waterlevel_value in zip(
-                time_seconds,
-                waterlevel_child_datum,
-            ):
-                f_wl.write(
-                    f"{format_time_seconds(time_value)}"
-                    f"{waterlevel_value:14.5f}\n"
-                )
-
-            f_wl.write("\n")
-
-            # ------------------------------------------------------
-            # Write T3D ux/uy advection-velocity forcing
-            # ------------------------------------------------------
-            write_uxuy_t3d_header(
-                f_uv,
-                station,
-                vertical_positions_percent_from_bed,
-            )
-
-            for time_index, time_value in enumerate(time_seconds):
-                row_values = []
-
-                for layer_index in range(n_layers):
-                    row_values.append(
-                        ux_sigma[time_index, layer_index]
+                for time_index, timestamp in enumerate(times):
+                    if (
+                        not np.isfinite(depth_values[time_index])
+                        or depth_values[time_index] <= 0
+                    ):
+                        raise ValueError(
+                            f"{station_name} is dry or has invalid depth at "
+                            f"{timestamp}."
+                        )
+                    ux_output[time_index] = interpolate_profile(
+                        z_values[time_index], ux_values[time_index], target_z[time_index]
                     )
-                    row_values.append(
-                        uy_sigma[time_index, layer_index]
+                    uy_output[time_index] = interpolate_profile(
+                        z_values[time_index], uy_values[time_index], target_z[time_index]
+                    )
+                    sal_output[time_index] = interpolate_profile(
+                        z_values[time_index], sal_values[time_index], target_z[time_index]
+                    )
+                    tem_output[time_index] = interpolate_profile(
+                        z_values[time_index], tem_values[time_index], target_z[time_index]
                     )
 
-                f_uv.write(format_time_seconds(time_value))
+                # Names are written exactly as stored in station_name.
+                forcing_prefix(
+                    f_wl, station_name, "timeseries", time_unit, vertical_positions
+                )
+                f_wl.write("quantity          = waterlevelbnd\n")
+                f_wl.write("unit              = m\n")
+                for seconds, value in zip(
+                    time_seconds, wl_values + WATERLEVEL_OFFSET_M
+                ):
+                    write_data_row(f_wl, int(seconds), np.array([value]))
+                f_wl.write("\n")
 
-                for value in row_values:
-                    f_uv.write(f"{value:14.5f}")
-
+                write_velocity_t3d_header(
+                    f_uv, station_name, time_unit, vertical_positions
+                )
+                for time_index, seconds in enumerate(time_seconds):
+                    # Column order: ux1, uy1, ux2, uy2, ...
+                    velocity_row = np.column_stack(
+                        (ux_output[time_index], uy_output[time_index])
+                    ).reshape(-1)
+                    write_data_row(f_uv, int(seconds), velocity_row)
                 f_uv.write("\n")
 
-            f_uv.write("\n")
-
-
-print("Finished writing:")
-print(f"  {out_wl.resolve()}")
-print(f"  {out_uv.resolve()}")
-
-# import xarray as xr
-# import numpy as np
-# import pandas as pd
-# from pathlib import Path
-
-# nc_path = r"DCSM-FM_0_5nm_restarted_his.nc"
-
-# out_wl = "nested_waterlevel.bc"
-# out_un = "nested_normalvelocity.bc"
-# out_ut = "nested_tangentialvelocity.bc"
-
-# ds = xr.open_dataset(nc_path)
-
-# station_names = [
-#     name.decode("utf-8").strip() if isinstance(name, bytes) else str(name).strip()
-#     for name in ds["station_name"].values
-# ]
-
-# # ------------------------------------------------------------------
-# # Time: seconds since target origin
-# # ------------------------------------------------------------------
-# time_values = pd.to_datetime(ds["time"].values)
-
-# time_origin = pd.Timestamp("2013-12-05 00:00:00")
-# time_seconds = (time_values - time_origin) / pd.Timedelta(seconds=1)
-# time_unit = "seconds since 2013-12-05 00:00:00"
-
-# # ------------------------------------------------------------------
-# # 5 sigma-layer centres, surface to bed
-# # ------------------------------------------------------------------
-# sigma_centres = np.array([-0.1, -0.3, -0.5, -0.7, -0.9])
-# n_layers = len(sigma_centres)
-
-# # TODO: replace by actual child-model bed levels at each boundary point
-# bedlevel = {station: -10.0 for station in station_names}
-
-# # Datum correction if needed
-# waterlevel_offset_msl_to_nap = 1.95  # m, replace by your estimated value
-
-# MSL2013_TO_NAP = {
-#     station: waterlevel_offset_msl_to_nap
-#     for station in station_names
-# }
-
-# def get_station_xy(ds):
-#     """Try common coordinate variable names in D-Flow FM history files."""
-#     x_candidates = ["station_x_coordinate", "station_x", "x_station", "station_xcoord"]
-#     y_candidates = ["station_y_coordinate", "station_y", "y_station", "station_ycoord"]
-
-#     xname = next((v for v in x_candidates if v in ds.variables), None)
-#     yname = next((v for v in y_candidates if v in ds.variables), None)
-
-#     if xname is None or yname is None:
-#         raise KeyError(
-#             "Could not find station x/y coordinates in his.nc. "
-#             "Check ds variables and update x_candidates/y_candidates."
-#         )
-
-#     return ds[xname].values, ds[yname].values
-
-
-# def boundary_vectors(x, y):
-#     """
-#     Compute tangential and normal unit vectors along ordered boundary support points.
-
-#     Tangential direction follows station order:
-#         offshore_0001 -> offshore_0002 -> ...
-
-#     Normal direction is tangent rotated clockwise:
-#         n = (ty, -tx)
-
-#     If normal velocity sign is opposite of what you expect, multiply normal by -1.
-#     """
-#     x = np.asarray(x, dtype=float)
-#     y = np.asarray(y, dtype=float)
-
-#     tx = np.zeros_like(x)
-#     ty = np.zeros_like(y)
-
-#     for i in range(len(x)):
-#         if i == 0:
-#             dx = x[i + 1] - x[i]
-#             dy = y[i + 1] - y[i]
-#         elif i == len(x) - 1:
-#             dx = x[i] - x[i - 1]
-#             dy = y[i] - y[i - 1]
-#         else:
-#             dx = x[i + 1] - x[i - 1]
-#             dy = y[i + 1] - y[i - 1]
-
-#         length = np.hypot(dx, dy)
-#         tx[i] = dx / length
-#         ty[i] = dy / length
-
-#     # Clockwise normal
-#     nx = ty.copy()
-#     ny = -tx.copy()
-
-#     return tx, ty, nx, ny
-
-
-# def interp_profile(z_parent, val_parent, z_target):
-#     """Interpolate one vertical profile, ignoring NaNs."""
-#     mask = np.isfinite(z_parent) & np.isfinite(val_parent)
-
-#     if np.sum(mask) < 2:
-#         return np.full_like(z_target, np.nan, dtype=float)
-
-#     z = z_parent[mask]
-#     v = val_parent[mask]
-
-#     order = np.argsort(z)
-#     z = z[order]
-#     v = v[order]
-
-#     return np.interp(z_target, z, v, left=v[0], right=v[-1])
-
-
-# def write_header_waterlevel(f, station):
-#     f.write("[forcing]\n")
-#     f.write(f"name              = {station}\n")
-#     f.write("function          = timeseries\n")
-#     f.write("timeInterpolation = linear\n")
-#     f.write("quantity          = time\n")
-#     f.write(f"unit              = {time_unit}\n")
-#     f.write("quantity          = waterlevelbnd\n")
-#     f.write("unit              = m\n")
-
-
-# def write_header_velocity(f, station, quantity):
-#     f.write("[forcing]\n")
-#     f.write(f"name              = {station}\n")
-#     f.write("function          = timeseries\n")
-#     f.write("timeInterpolation = linear\n")
-#     f.write("quantity          = time\n")
-#     f.write(f"unit              = {time_unit}\n")
-#     f.write(f"quantity          = {quantity}\n")
-#     f.write("unit              = m/s\n")
-#     f.write("verticalPositionType = index\n")
-#     f.write("verticalProfileType  = uniform\n")
-
-
-# # ------------------------------------------------------------------
-# # Get boundary directions from station coordinates
-# # ------------------------------------------------------------------
-# x_station, y_station = get_station_xy(ds)
-
-# # ------------------------------------------------------------
-# # Compute boundary directions separately for each boundary group
-# # ------------------------------------------------------------
-# boundary_groups = ["north", "south", "offshore"]
-
-# tx_all = np.full(len(station_names), np.nan)
-# ty_all = np.full(len(station_names), np.nan)
-# nx_all = np.full(len(station_names), np.nan)
-# ny_all = np.full(len(station_names), np.nan)
-
-# for boundary in boundary_groups:
-
-#     indices = [
-#         i for i, name in enumerate(station_names)
-#         if name.lower().startswith(boundary)
-#     ]
-
-#     if len(indices) == 0:
-#         print(f"No stations found for boundary: {boundary}")
-#         continue
-
-#     x_b = x_station[indices]
-#     y_b = y_station[indices]
-
-#     tx_b, ty_b, nx_b, ny_b = boundary_vectors(x_b, y_b)
-
-#     tx_all[indices] = tx_b
-#     ty_all[indices] = ty_b
-#     nx_all[indices] = nx_b
-#     ny_all[indices] = ny_b
-
-# for boundary in ["north", "south", "offshore"]:
-#     print("\n", boundary)
-#     for i, name in enumerate(station_names):
-#         if name.lower().startswith(boundary):
-#             print(
-#                 name,
-#                 "t=(", tx_all[i], ty_all[i], ")",
-#                 "n=(", nx_all[i], ny_all[i], ")",
-#             )
-
-# with open(out_wl, "w") as f_wl, \
-#      open(out_un, "w") as f_un, \
-#      open(out_ut, "w") as f_ut:
-
-#     for idx, station in enumerate(station_names):
-
-#         wl_msl2013 = ds["waterlevel"].isel(station=idx).values
-#         wl = wl_msl2013 + MSL2013_TO_NAP[station]
-
-#         u_parent = ds["x_velocity"].isel(station=idx).values
-#         v_parent = ds["y_velocity"].isel(station=idx).values
-#         z_parent = ds["zcoordinate_c"].isel(station=idx).values
-
-#         zb = bedlevel[station]
-
-#         u_sigma = np.zeros((len(time_seconds), n_layers))
-#         v_sigma = np.zeros((len(time_seconds), n_layers))
-
-#         for it, eta in enumerate(wl):
-#             z_sigma = eta + sigma_centres * (eta - zb)
-
-#             u_sigma[it, :] = interp_profile(
-#                 z_parent[it, :],
-#                 u_parent[it, :],
-#                 z_sigma
-#             )
-
-#             v_sigma[it, :] = interp_profile(
-#                 z_parent[it, :],
-#                 v_parent[it, :],
-#                 z_sigma
-#             )
-
-#         # Project to normal and tangential components
-#         normal_sigma = u_sigma * nx_all[idx] + v_sigma * ny_all[idx]
-#         tangential_sigma = u_sigma * tx_all[idx] + v_sigma * ty_all[idx]
-
-#         # ----------------------------------------------------------
-#         # Water level file
-#         # ----------------------------------------------------------
-#         write_header_waterlevel(f_wl, station)
-
-#         for t, value in zip(time_seconds, wl):
-#             f_wl.write(f"{t:12.0f}\t{value:12.5f}\n")
-
-#         f_wl.write("\n")
-
-#         # ----------------------------------------------------------
-#         # Normal velocity file
-#         # ----------------------------------------------------------
-#         write_header_velocity(f_un, station, "normalvelocitybnd")
-
-#         for it, t in enumerate(time_seconds):
-#             for k in range(n_layers):
-#                 f_un.write(
-#                     f"{t:12.0f}\t{k + 1:d}\t{normal_sigma[it, k]:12.5f}\n"
-#                 )
-
-#         f_un.write("\n")
-
-#         # ----------------------------------------------------------
-#         # Tangential velocity file
-#         # ----------------------------------------------------------
-#         write_header_velocity(f_ut, station, "tangentialvelocitybnd")
-
-#         for it, t in enumerate(time_seconds):
-#             for k in range(n_layers):
-#                 f_ut.write(
-#                     f"{t:12.0f}\t{k + 1:d}\t{tangential_sigma[it, k]:12.5f}\n"
-#                 )
-
-#         f_ut.write("\n")
-
-# print(f"Finished writing:")
-# print(f"  {out_wl}")
-# print(f"  {out_un}")
-# print(f"  {out_ut}")
+                write_scalar_t3d_header(
+                    f_sal,
+                    station_name,
+                    time_unit,
+                    vertical_positions,
+                    "salinitybnd",
+                    "ppt",
+                )
+                for time_index, seconds in enumerate(time_seconds):
+                    write_data_row(f_sal, int(seconds), sal_output[time_index])
+                f_sal.write("\n")
+
+                write_scalar_t3d_header(
+                    f_tem,
+                    station_name,
+                    time_unit,
+                    vertical_positions,
+                    "temperaturebnd",
+                    "degC",
+                )
+                for time_index, seconds in enumerate(time_seconds):
+                    write_data_row(f_tem, int(seconds), tem_output[time_index])
+                f_tem.write("\n")
+
+    print("\nFinished writing BC files:")
+    for path in output_paths.values():
+        print(f"  {path.resolve()}")
+    print(
+        "\nIMPORTANT: every [Forcing] name must exactly match the "
+        "support-point name expected from the existing PLI files."
+    )
+
+
+if __name__ == "__main__":
+    main()
