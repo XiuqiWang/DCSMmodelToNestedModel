@@ -19,8 +19,10 @@ import xarray as xr
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
-HISTORY_FILE = Path(r"C:\dev\Python\DCSMmodelToNestedModel\hist_files\DCSM-FM_0_5nm_0000_his.nc")
+HISTORY_FILE = Path(r"C:\dev\Python\DCSMmodelToNestedModel\hist_files\DCSM-FM_0_5nm_60min_his.nc")
 OUTPUT_DIRECTORY = Path(r"bc_files")
+
+T_bc = 60 #min
 
 # Recommended child-model vertical grid:
 #   Kmx         = 10
@@ -58,10 +60,10 @@ BC_REFERENCE_TIME: pd.Timestamp | None = None
 # Keep zero unless a verified parent-to-child vertical-datum difference exists.
 WATERLEVEL_OFFSET_M = 0.0
 
-OUTPUT_WATERLEVEL = "nested_waterlevel.bc"
-OUTPUT_VELOCITY = "nested_uxuyadvectionvelocity.bc"
-OUTPUT_SALINITY = "nested_salinity.bc"
-OUTPUT_TEMPERATURE = "nested_temperature.bc"
+OUTPUT_WATERLEVEL = f"nested_waterlevel_{T_bc}min.bc"
+OUTPUT_VELOCITY = f"nested_uxuyadvectionvelocity_{T_bc}min.bc"
+OUTPUT_SALINITY = f"nested_salinity_{T_bc}min.bc"
+OUTPUT_TEMPERATURE = f"nested_temperature_{T_bc}min.bc"
 
 
 # =============================================================================
@@ -401,12 +403,15 @@ def main() -> None:
             "temperature": OUTPUT_DIRECTORY / OUTPUT_TEMPERATURE,
         }
 
-        with (
-            output_paths["waterlevel"].open("w", encoding="utf-8", newline="\n") as f_wl,
-            output_paths["velocity"].open("w", encoding="utf-8", newline="\n") as f_uv,
-            output_paths["salinity"].open("w", encoding="utf-8", newline="\n") as f_sal,
-            output_paths["temperature"].open("w", encoding="utf-8", newline="\n") as f_tem,
-        ):
+        with output_paths["waterlevel"].open(
+            "w", encoding="utf-8", newline="\n"
+        ) as f_wl, output_paths["velocity"].open(
+            "w", encoding="utf-8", newline="\n"
+        ) as f_uv, output_paths["salinity"].open(
+            "w", encoding="utf-8", newline="\n"
+        ) as f_sal, output_paths["temperature"].open(
+            "w", encoding="utf-8", newline="\n"
+        ) as f_tem:
             for station_index in selected_indices:
                 station_name = station_names[station_index]
                 wl_values = np.asarray(
